@@ -2,5 +2,9 @@
 resolver = "2"
 members = [
   "sentinel",
-  "tools/upstream_stub"
+  "helios",
+  "bench",
+  "atlas",
+  "netlab",
+  "tools/upstream_stub",
 ]
