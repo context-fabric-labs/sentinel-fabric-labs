@@ -1,5 +1,5 @@
 
-12 sections map to the phases (at a glance)
+ sections(12) map to the phases (at a glance)
 •	(1) GPU microarch → Phase B, E, F
 •	(2) kernel/framework opt → Phase E, F (+ Modules 5–7)
 •	(3) profiling/tooling → Phase A, B, F
