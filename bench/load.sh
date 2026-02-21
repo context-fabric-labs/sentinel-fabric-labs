@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-URL="${1:-http://127.0.0.1:8080/v1/chat/completions}"
-oha -z 20s -c 50 -m POST \
-  -H "content-type: application/json" \
-  -d '{"model":"stub","messages":[{"role":"user","content":"hello"}]}' \
-  "$URL"
+URL="${1:-http://127.0.0.1:3000/health}"
+CONC="${CONC:-32}"
+REQ="${REQ:-2000}"
+
+cargo run -q -p bench -- run --scenario health --url "$URL" --concurrency "$CONC" --requests "$REQ"

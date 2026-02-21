@@ -58,7 +58,9 @@ async fn main() {
     let upstream_base =
         std::env::var("UPSTREAM_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
 
-    let recorder = PrometheusBuilder::new().install_recorder().expect("prom recorder");
+    let recorder = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("prom recorder");
     let handle = Arc::new(recorder);
 
     let client = Client::builder(TokioExecutor::new()).build_http();
@@ -74,7 +76,6 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(args.max_body_bytes));
 
-
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/metrics", get(metrics_handler))
@@ -83,7 +84,10 @@ async fn main() {
         .layer(middleware);
 
     let addr: SocketAddr = args.bind.parse().expect("bind parse");
-    info!("sentinel listening on {addr} upstream={}", std::env::var("UPSTREAM_URL").ok().unwrap_or_default());
+    info!(
+        "sentinel listening on {addr} upstream={}",
+        std::env::var("UPSTREAM_URL").ok().unwrap_or_default()
+    );
     axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
         .await
         .unwrap();
@@ -119,7 +123,8 @@ async fn proxy_handler(State(st): State<AppState>, req: Request<Body>) -> impl I
 
     // Set HOST to upstream host (helps some upstreams)
     parts.headers.remove(HOST);
-    let mut upstream_req = Request::from_parts(parts, Body::from(body.collect().await.unwrap().to_bytes()));
+    let mut upstream_req =
+        Request::from_parts(parts, Body::from(body.collect().await.unwrap().to_bytes()));
     *upstream_req.uri_mut() = upstream_uri;
 
     // Forward
