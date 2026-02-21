@@ -1,0 +1,569 @@
+1) Add tools/upstream_stub (fake upstream service)
+tools/upstream_stub/Cargo.toml
+[package]
+name = "upstream_stub"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tools/upstream_stub/src/main.rs
+use axum::{routing::{get, post}, Json, Router};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::net::SocketAddr;
+
+#[derive(Debug, Deserialize)]
+struct ChatReq {
+    model: Option<String>,
+    messages: Option<Vec<Message>>,
+    max_tokens: Option<u32>,
+    stream: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Message {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatResp {
+    id: String,
+    object: String,
+    choices: Vec<Choice>,
+}
+
+#[derive(Debug, Serialize)]
+struct Choice {
+    index: u32,
+    message: AssistantMessage,
+    finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AssistantMessage {
+    role: String,
+    content: String,
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(json!({ "ok": true, "service": "upstream_stub", "version": "0.0.0" }))
+}
+
+async fn chat(Json(req): Json<ChatReq>) -> Json<ChatResp> {
+    // Non-stream MVP stub. (Sentinel streaming comes later in Epic 1.)
+    let prompt_preview = req.messages
+        .as_ref()
+        .and_then(|m| m.last())
+        .map(|m| m.content.chars().take(80).collect::<String>())
+        .unwrap_or_else(|| "<no-messages>".to_string());
+
+    let content = format!(
+        "stub response (model={:?}, max_tokens={:?}) :: {}",
+        req.model, req.max_tokens, prompt_preview
+    );
+
+    Json(ChatResp {
+        id: "stub-1".into(),
+        object: "chat.completion".into(),
+        choices: vec![Choice {
+            index: 0,
+            message: AssistantMessage { role: "assistant".into(), content },
+            finish_reason: "stop".into(),
+        }],
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/chat/completions", post(chat));
+
+    let addr: SocketAddr = "0.0.0.0:4000".parse().unwrap();
+    println!("upstream_stub listening on http://{addr}");
+
+    axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+2) Add the benchmark runner (bench crate)
+bench/Cargo.toml
+[package]
+name = "bench"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+hdrhistogram = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+num_cpus = "1"
+
+bench/src/main.rs
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use chrono::{DateTime, Utc};
+use hdrhistogram::Histogram;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    process::Command,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::{mpsc, Semaphore};
+
+#[derive(Parser, Debug)]
+#[command(name = "bench")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Run a load test and write JSON result
+    Run {
+        #[arg(long, default_value = "health")]
+        scenario: String,
+
+        #[arg(long)]
+        url: String,
+
+        #[arg(long, default_value_t = 32)]
+        concurrency: usize,
+
+        #[arg(long, default_value_t = 2000)]
+        requests: usize,
+
+        #[arg(long, default_value_t = 5)]
+        timeout_s: u64,
+
+        #[arg(long, default_value_t = 200)]
+        warmup_requests: usize,
+
+        /// Optional output path. If omitted, writes to bench/results/<scenario>-<ts>.json
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Pretty-print a JSON result
+    Report {
+        file: PathBuf,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BenchResult {
+    scenario: String,
+    url: String,
+    concurrency: usize,
+    requests: usize,
+    warmup_requests: usize,
+    timeout_s: u64,
+    timestamp_utc: DateTime<Utc>,
+
+    wall_time_ms: u64,
+    rps: f64,
+
+    errors: u64,
+    status_counts: BTreeMap<String, u64>,
+
+    latency_us: LatencyStats,
+
+    env: EnvInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LatencyStats {
+    p50: u64,
+    p95: u64,
+    p99: u64,
+    max: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EnvInfo {
+    os: String,
+    arch: String,
+    cpu_count: usize,
+    git_commit: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.cmd {
+        Cmd::Run {
+            scenario,
+            url,
+            concurrency,
+            requests,
+            timeout_s,
+            warmup_requests,
+            out,
+        } => {
+            let res = run_bench(
+                scenario,
+                url,
+                concurrency,
+                requests,
+                warmup_requests,
+                Duration::from_secs(timeout_s),
+            )
+            .await?;
+
+            let out_path = out.unwrap_or_else(|| default_out_path(&res.scenario));
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create dir {:?}", parent))?;
+            }
+            std::fs::write(&out_path, serde_json::to_vec_pretty(&res)?)?;
+            println!("wrote {:?}", out_path);
+            print_summary(&res);
+        }
+        Cmd::Report { file } => {
+            let bytes = std::fs::read(&file)?;
+            let res: BenchResult = serde_json::from_slice(&bytes)?;
+            print_summary(&res);
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
+    }
+
+    Ok(())
+}
+
+fn default_out_path(scenario: &str) -> PathBuf {
+    let ts = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    PathBuf::from(format!("bench/results/{}-{}.json", scenario, ts))
+}
+
+fn env_info() -> EnvInfo {
+    let git_commit = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None });
+
+    EnvInfo {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        cpu_count: num_cpus::get(),
+        git_commit,
+    }
+}
+
+async fn run_bench(
+    scenario: String,
+    url: String,
+    concurrency: usize,
+    requests: usize,
+    warmup_requests: usize,
+    timeout: Duration,
+) -> Result<BenchResult> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()?;
+
+    // Warmup (ignore measurements)
+    run_load(&client, &url, concurrency, warmup_requests, true).await?;
+
+    // Measured run
+    let t0 = Instant::now();
+    let (hist, errors, status_counts, completed) =
+        run_load(&client, &url, concurrency, requests, false).await?;
+    let wall = t0.elapsed();
+
+    let wall_ms = wall.as_millis() as u64;
+    let rps = if wall.as_secs_f64() > 0.0 {
+        completed as f64 / wall.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    let p50 = hist.value_at_quantile(0.50);
+    let p95 = hist.value_at_quantile(0.95);
+    let p99 = hist.value_at_quantile(0.99);
+    let max = hist.max();
+
+    Ok(BenchResult {
+        scenario,
+        url,
+        concurrency,
+        requests,
+        warmup_requests,
+        timeout_s: timeout.as_secs(),
+        timestamp_utc: Utc::now(),
+        wall_time_ms: wall_ms,
+        rps,
+        errors,
+        status_counts,
+        latency_us: LatencyStats { p50, p95, p99, max },
+        env: env_info(),
+    })
+}
+
+async fn run_load(
+    client: &reqwest::Client,
+    url: &str,
+    concurrency: usize,
+    requests: usize,
+    warmup: bool,
+) -> Result<(Histogram<u64>, u64, BTreeMap<String, u64>, usize)> {
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let (tx, mut rx) = mpsc::unbounded_channel::<(u16, u64, bool)>();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..requests {
+        let permit = sem.clone().acquire_owned().await?;
+        let tx = tx.clone();
+        let client = client.clone();
+        let url = url.to_string();
+        let in_flight = in_flight.clone();
+
+        in_flight.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let start = Instant::now();
+            let ok = match client.get(url).send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let _ = resp.bytes().await; // drain
+                    let us = start.elapsed().as_micros() as u64;
+                    let _ = tx.send((status, us, true));
+                    true
+                }
+                Err(_) => {
+                    let us = start.elapsed().as_micros() as u64;
+                    let _ = tx.send((0, us, false));
+                    false
+                }
+            };
+            let _ = ok;
+            in_flight.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+    drop(tx);
+
+    let mut hist = Histogram::<u64>::new_with_max(60_000_000, 3)?; // up to 60s in us
+    let mut errors: u64 = 0;
+    let mut status_counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut completed: usize = 0;
+
+    while let Some((status, us, ok)) = rx.recv().await {
+        completed += 1;
+        if !warmup {
+            let _ = hist.record(us);
+        }
+        if !ok || status >= 500 || status == 0 {
+            errors += 1;
+        }
+        let key = if status == 0 { "ERR".to_string() } else { status.to_string() };
+        *status_counts.entry(key).or_insert(0) += 1;
+    }
+
+    Ok((hist, errors, status_counts, completed))
+}
+
+fn print_summary(res: &BenchResult) {
+    println!(
+        "scenario={} conc={} req={} rps={:.1} errors={} p50={}us p95={}us p99={}us max={}us wall={}ms",
+        res.scenario,
+        res.concurrency,
+        res.requests,
+        res.rps,
+        res.errors,
+        res.latency_us.p50,
+        res.latency_us.p95,
+        res.latency_us.p99,
+        res.latency_us.max,
+        res.wall_time_ms
+    );
+}
+
+3) Scripts: run services + run bench
+scripts/run_cell.sh (starts upstream + sentinel)
+#!/usr/bin/env bash
+set -euo pipefail
+
+cargo run -q -p upstream_stub &
+UP_PID=$!
+
+cargo run -q -p sentinel &
+SEN_PID=$!
+
+echo "upstream_stub pid=$UP_PID (4000), sentinel pid=$SEN_PID (3000)"
+echo "ctrl-c to stop"
+
+cleanup() {
+  kill $SEN_PID >/dev/null 2>&1 || true
+  kill $UP_PID  >/dev/null 2>&1 || true
+}
+trap cleanup INT TERM EXIT
+
+wait
+
+
+Make executable:
+
+chmod +x scripts/run_cell.sh
+
+bench/load.sh (simple wrapper)
+#!/usr/bin/env bash
+set -euo pipefail
+
+URL="${1:-http://127.0.0.1:3000/health}"
+CONC="${CONC:-32}"
+REQ="${REQ:-2000}"
+
+cargo run -q -p bench -- run --scenario health --url "$URL" --concurrency "$CONC" --requests "$REQ"
+
+
+Make executable:
+
+chmod +x bench/load.sh
+
+4) Regression harness (baseline vs candidate)
+scripts/regress.py
+#!/usr/bin/env python3
+import argparse, json, sys
+
+def load(p):
+    with open(p, "r") as f:
+        return json.load(f)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--baseline", required=True)
+    ap.add_argument("--candidate", required=True)
+    ap.add_argument("--budget_p99", type=float, default=0.10, help="allowed increase fraction (0.10 = +10%)")
+    args = ap.parse_args()
+
+    b = load(args.baseline)
+    c = load(args.candidate)
+
+    bp99 = b["latency_us"]["p99"]
+    cp99 = c["latency_us"]["p99"]
+
+    limit = int(bp99 * (1.0 + args.budget_p99))
+
+    print(f"baseline p99={bp99}us  candidate p99={cp99}us  limit={limit}us  budget={args.budget_p99*100:.1f}%")
+
+    if c["errors"] != 0:
+        print(f"FAIL: candidate errors={c['errors']}")
+        sys.exit(2)
+
+    if cp99 > limit:
+        print("FAIL: p99 regression")
+        sys.exit(3)
+
+    print("OK")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+Make executable:
+
+chmod +x scripts/regress.py
+
+Create a baseline (one-time)
+
+Run sentinel, then:
+
+cargo run -q -p sentinel &
+SEN_PID=$!
+sleep 0.5
+
+cargo run -q -p bench -- run --scenario health --url http://127.0.0.1:3000/health --concurrency 32 --requests 2000 --out bench/baselines/local_health.json
+
+kill $SEN_PID
+
+
+Then compare a new run against it:
+
+cargo run -q -p bench -- run --scenario health --url http://127.0.0.1:3000/health --concurrency 32 --requests 2000 --out bench/results/cand.json
+./scripts/regress.py --baseline bench/baselines/local_health.json --candidate bench/results/cand.json --budget_p99 0.10
+
+5) Perf pack (Linux-only, optional in Epic 0 but included)
+scripts/perf_stat.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "perf_stat.sh: Linux-only (perf). Skipping."
+  exit 0
+fi
+
+OUT="${1:-bench/results/perf_stat.txt}"
+shift || true
+
+mkdir -p "$(dirname "$OUT")"
+
+EVENTS="context-switches,cpu-migrations,page-faults,cycles,instructions,cache-misses,dTLB-load-misses,LLC-load-misses"
+
+echo "running: perf stat -e $EVENTS -o $OUT -- $*"
+perf stat -e "$EVENTS" -o "$OUT" -- "$@"
+echo "wrote $OUT"
+
+scripts/flamegraph.sh (needs inferno)
+
+Install on Linux:
+
+cargo install inferno
+
+
+Script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "flamegraph.sh: Linux-only (perf). Skipping."
+  exit 0
+fi
+
+OUT="${1:-bench/results/flame.svg}"
+shift || true
+
+mkdir -p "$(dirname "$OUT")"
+
+perf record -F 99 -g -- "$@"
+perf script | inferno-collapse-perf | inferno-flamegraph > "$OUT"
+echo "wrote $OUT"
+
+Epic 0 Done criteria (S0.1 + S0.2)
+
+✅ You can run all of these:
+
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+./scripts/run_cell.sh        # starts processes
+./bench/load.sh              # writes JSON to bench/results/...
+./scripts/regress.py --baseline bench/baselines/local_health.json --candidate <new_result>.json --budget_p99 0.10
+
+Your

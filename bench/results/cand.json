@@ -1,0 +1,27 @@
+{
+  "scenario": "health",
+  "url": "http://127.0.0.1:8080/health",
+  "concurrency": 32,
+  "requests": 2000,
+  "warmup_requests": 200,
+  "timeout_s": 5,
+  "timestamp_utc": "2026-02-20T05:04:21.659121Z",
+  "wall_time_ms": 34,
+  "rps": 58156.44082582147,
+  "errors": 0,
+  "status_counts": {
+    "200": 2000
+  },
+  "latency_us": {
+    "p50": 429,
+    "p95": 702,
+    "p99": 849,
+    "max": 1083
+  },
+  "env": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpu_count": 12,
+    "git_commit": "62c83e6"
+  }
+}
