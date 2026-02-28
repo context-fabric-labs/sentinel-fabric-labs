@@ -13,7 +13,7 @@
 •	(11) reliability/observability → Phase A–D, C, H
 •	(12) Linux/systems programming practice → Phase A, B, E, H
 
-
+ 
 Phase A — Get a working vertical slice + measurement
 1.	Epic 0: repo + benchmark harness + perf pack (your “science rig”)
 2.	Epic 1: Sentinel v0 (correct proxy + hard bounds + metrics)
@@ -197,7 +197,24 @@ Module	Key Keywords to Master	Why it gets you the job
 
 
 
-Draft (To be Removed later )
+Quick start (Sentinel + Upstream + Bench)
+
+- Start upstream stub: `cargo run -p upstream_stub`
+- Start sentinel: `cargo run -p sentinel`
+- Health: `curl -i http://127.0.0.1:8080/health`
+- Metrics: `curl -s http://127.0.0.1:8080/metrics | grep sentinel_`
+- Chat POST:
+   `curl -i -H 'content-type: application/json' \
+      -d '{"model":"stub","messages":[{"role":"user","content":"hello"}],"max_tokens":16,"stream":false}' \
+      http://127.0.0.1:8080/v1/chat/completions`
+
+Bench examples:
+
+```
+cargo run -q -p bench -- run --scenario health --url http://127.0.0.1:8080/health
+cargo run -q -p bench -- run --scenario chat --url http://127.0.0.1:8080/v1/chat/completions
+./scripts/sweep_chat.sh http://127.0.0.1:8080/v1/chat/completions
+```
 Module 1: The Accelerator (GPU Architecture & Memory)
 Target Resume Area: "Deep understanding of memory hierarchy (HBM/DRAM), cache behavior, and vectorization."
 1. GPU Physical Architecture

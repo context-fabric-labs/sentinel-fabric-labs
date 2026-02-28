@@ -1,0 +1,27 @@
+{
+  "scenario": "chat",
+  "url": "http://127.0.0.1:8080/v1/chat/completions",
+  "concurrency": 8,
+  "requests": 200,
+  "warmup_requests": 20,
+  "timeout_s": 10,
+  "timestamp_utc": "2026-02-28T22:17:56.137249Z",
+  "wall_time_ms": 17,
+  "rps": 11436.05910658533,
+  "errors": 0,
+  "status_counts": {
+    "200": 200
+  },
+  "latency_us": {
+    "p50": 579,
+    "p95": 1252,
+    "p99": 1634,
+    "max": 1794
+  },
+  "env": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpu_count": 12,
+    "git_commit": "888e471"
+  }
+}

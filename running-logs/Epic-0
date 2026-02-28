@@ -566,4 +566,45 @@ cargo test --workspace
 ./bench/load.sh              # writes JSON to bench/results/...
 ./scripts/regress.py --baseline bench/baselines/local_health.json --candidate <new_result>.json --budget_p99 0.10
 
-Your
+===
+S1.2 Tests
+Terminal A:
+cargo run -q -p upstream_stub
+
+Terminal B (use small limits so you can trigger them):
+cargo run -q -p sentinel -- --max-inflight 2 --max-body-bytes 1000 --timeout-ms 200
+
+Terminal C:
+Test 1: Body too large → expect 413
+
+Send a 2KB payload (limit is 1000 bytes):
+
+python3 - <<'PY' | curl -sS -o /dev/null -w "%{http_code}\n" \
+  -H "content-type: application/json" \
+  --data-binary @- \
+  http://127.0.0.1:8080/v1/chat/completions
+import json
+big = "x"*2000
+print(json.dumps({"model":"stub","messages":[{"role":"user","content":big}],"max_tokens":16,"stream":False}))
+PY
+
+Expected output: 413 (Indentation error may come, please fix it)
+
+Then verify counters:
+
+curl -fsS http://127.0.0.1:8080/metrics | egrep "payload_too_large|sentinel_responses_total"
+
+Test-3:-
+
+Run this (client cancels after 0.2s):
+
+curl --max-time 0.2 -sS -o /dev/null \
+  -H "content-type: application/json" \
+  -d '{"model":"stub","messages":[{"role":"user","content":"cancel pls"}],"max_tokens":8000,"stream":false}' \
+  http://127.0.0.1:8080/v1/chat/completions || true
+
+Now look at the upstream_stub terminal:
+
+==
+
+

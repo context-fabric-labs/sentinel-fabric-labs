@@ -6,6 +6,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
 
+struct CancelLog {
+    name: &'static str,
+    completed: bool,
+}
+impl CancelLog {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            completed: false,
+        }
+    }
+}
+impl Drop for CancelLog {
+    fn drop(&mut self) {
+        if !self.completed {
+            eprintln!("upstream_stub: request canceled ({})", self.name);
+        }
+    }
+}
 #[derive(Debug, Deserialize)]
 struct ChatReq {
     model: Option<String>,
@@ -45,10 +64,12 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn chat(Json(req): Json<ChatReq>) -> Json<ChatResp> {
+    let mut cancel = CancelLog::new("chat");
     // Validate / acknowledge stream flag (non-stream MVP)
     if req.stream.unwrap_or(false) {
         // You can either reject or just ignore but "read" it.
         // Here we reject to keep semantics honest.
+        cancel.completed = true;
         return Json(ChatResp {
             id: "stub-err".into(),
             object: "chat.completion".into(),
@@ -56,7 +77,8 @@ async fn chat(Json(req): Json<ChatReq>) -> Json<ChatResp> {
                 index: 0,
                 message: AssistantMessage {
                     role: "assistant".into(),
-                    content: "upstream_stub: stream=true not supported in stub (use stream=false)".into(),
+                    content: "upstream_stub: stream=true not supported in stub (use stream=false)"
+                        .into(),
                 },
                 finish_reason: "stop".into(),
             }],
@@ -76,12 +98,16 @@ async fn chat(Json(req): Json<ChatReq>) -> Json<ChatResp> {
         req.model, req.max_tokens, last_role, prompt_preview
     );
 
+    cancel.completed = true;
     Json(ChatResp {
         id: "stub-1".into(),
         object: "chat.completion".into(),
         choices: vec![Choice {
             index: 0,
-            message: AssistantMessage { role: "assistant".into(), content },
+            message: AssistantMessage {
+                role: "assistant".into(),
+                content,
+            },
             finish_reason: "stop".into(),
         }],
     })

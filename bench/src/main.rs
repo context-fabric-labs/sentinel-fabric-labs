@@ -1,7 +1,15 @@
+/*
+Examples:
+- Health GET:    cargo run -p bench -- run --scenario health --url http://127.0.0.1:8080/health
+- Chat POST:     cargo run -p bench -- run --scenario chat --url http://127.0.0.1:8080/v1/chat/completions
+- Chat with JSON: cargo run -p bench -- run --scenario chat --url http://127.0.0.1:8080/v1/chat/completions --body-json '{"model":"stub","messages":[{"role":"user","content":"hi"}],"max_tokens":16,"stream":false}'
+*/
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use hdrhistogram::Histogram;
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -43,6 +51,14 @@ enum Cmd {
 
         #[arg(long, default_value_t = 200)]
         warmup_requests: usize,
+
+        /// Optional body file for chat scenarios (POST JSON)
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+
+        /// Optional raw JSON string for chat scenarios (POST JSON)
+        #[arg(long)]
+        body_json: Option<String>,
 
         /// Optional output path. If omitted, writes to bench/results/<scenario>-<ts>.json
         #[arg(long)]
@@ -102,6 +118,8 @@ async fn main() -> Result<()> {
             requests,
             timeout_s,
             warmup_requests,
+            body_file,
+            body_json,
             out,
         } => {
             let res = run_bench(
@@ -111,6 +129,7 @@ async fn main() -> Result<()> {
                 requests,
                 warmup_requests,
                 Duration::from_secs(timeout_s),
+                BenchBody { file: body_file, json: body_json },
             )
             .await?;
 
@@ -160,6 +179,11 @@ fn env_info() -> EnvInfo {
     }
 }
 
+struct BenchBody {
+    file: Option<PathBuf>,
+    json: Option<String>,
+}
+
 async fn run_bench(
     scenario: String,
     url: String,
@@ -167,16 +191,45 @@ async fn run_bench(
     requests: usize,
     warmup_requests: usize,
     timeout: Duration,
+    body: BenchBody,
 ) -> Result<BenchResult> {
+    let body_file = body.file;
+    let body_json = body.json;
     let client = reqwest::Client::builder().timeout(timeout).build()?;
 
+    // Build request spec based on scenario
+    let is_chat = scenario.to_lowercase().starts_with("chat");
+    let spec = if is_chat {
+        // Determine JSON body precedence: body_json > body_file > default
+        let body = {
+            if let Some(s) = body_json.clone() {
+                Some(s)
+            } else if let Some(p) = body_file.clone() {
+                Some(std::fs::read_to_string(p)?)
+            } else {
+                Some("{\"model\":\"stub\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":16,\"stream\":false}".to_string())
+            }
+        };
+        RequestSpec {
+            method: Method::POST,
+            body,
+            is_json: true,
+        }
+    } else {
+        RequestSpec {
+            method: Method::GET,
+            body: None,
+            is_json: false,
+        }
+    };
+
     // Warmup (ignore measurements)
-    run_load(&client, &url, concurrency, warmup_requests, true).await?;
+    run_load(&client, &url, concurrency, warmup_requests, true, &spec).await?;
 
     // Measured run
     let t0 = Instant::now();
     let (hist, errors, status_counts, completed) =
-        run_load(&client, &url, concurrency, requests, false).await?;
+        run_load(&client, &url, concurrency, requests, false, &spec).await?;
     let wall = t0.elapsed();
 
     let wall_ms = wall.as_millis() as u64;
@@ -214,6 +267,7 @@ async fn run_load(
     concurrency: usize,
     requests: usize,
     warmup: bool,
+    spec: &RequestSpec,
 ) -> Result<(Histogram<u64>, u64, BTreeMap<String, u64>, usize)> {
     let sem = Arc::new(Semaphore::new(concurrency));
     let (tx, mut rx) = mpsc::unbounded_channel::<(u16, u64, bool)>();
@@ -225,12 +279,20 @@ async fn run_load(
         let client = client.clone();
         let url = url.to_string();
         let in_flight = in_flight.clone();
+        let spec = spec.clone();
 
         in_flight.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _permit = permit;
             let start = Instant::now();
-            let ok = match client.get(url).send().await {
+            let mut req = client.request(spec.method.clone(), url);
+            if let Some(body) = &spec.body {
+                req = req.body(body.clone());
+            }
+            if spec.is_json {
+                req = req.header("content-type", "application/json");
+            }
+            let ok = match req.send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let _ = resp.bytes().await; // drain
@@ -272,6 +334,13 @@ async fn run_load(
     }
 
     Ok((hist, errors, status_counts, completed))
+}
+
+#[derive(Clone, Debug)]
+struct RequestSpec {
+    method: Method,
+    body: Option<String>,
+    is_json: bool,
 }
 
 fn print_summary(res: &BenchResult) {
