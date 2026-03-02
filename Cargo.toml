@@ -3,5 +3,6 @@ resolver = "2"
 members = [
   "sentinel",
   "tools/upstream_stub",
-  "bench"
+  "bench",
+  "labs/cfs_cliff"
 ]

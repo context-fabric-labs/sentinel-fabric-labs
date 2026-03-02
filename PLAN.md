@@ -103,6 +103,30 @@
 
 **Sections hit:** (12) Linux/NUMA, (3) perf methodology, supports (1)(2).
 
+### Implementation Tasks
+- Create new crate `labs/cfs_cliff` with CLI interface
+- Implement contended and sharded modes with lock contention
+- Add busy-spin workloads to simulate CPU contention
+- Implement HDR histogram for latency measurements
+- Add JSON output with standardized schema
+
+### Test Tasks
+- Unit tests for busy_spin function
+- Sharding logic validation
+- JSON serialization/deserialization tests
+- Smoke test with small parameters
+
+### Artifact Outputs
+- `labs/results/s21-contended.json` - Contended mode results
+- `labs/results/s21-sharded.json` - Sharded mode results
+- `labs/results/s21-contended-perf-*.txt` - Perf stats for contended mode (Linux)
+- `labs/results/s21-sharded-perf-*.txt` - Perf stats for sharded mode (Linux)
+
+### Required Readings
+- Linux scheduling basics: CFS, runqueue, context switches, CPU migrations
+- perf stat interpretation: context-switches, cpu-migrations, task-clock
+- Mutex contention and scalability patterns: sharding, reducing critical sections
+
 ## Epic 3 — GPU Guardrails + Profiling Mastery
 **Merge: E5 + E10 + Module 1 + part of M5**
 
