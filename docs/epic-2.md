@@ -241,3 +241,35 @@ scripts/epic2_perf_stat.sh
 - Performance regression testing methodology
 - Threshold setting and validation
 - Perf stat usage and interpretation
+
+## Code Map
+
+This epic implements four systems physics labs that demonstrate various aspects of system behavior under different conditions. The following files and directories were created/modified:
+
+### New Crates Created:
+- `labs/cfs_cliff/` - CFS Cliff Lab implementation
+  - `Cargo.toml` - Crate configuration
+  - `src/lib.rs` - Core implementation with CLI parsing, memory access patterns, and performance metrics
+  - `src/main.rs` - CLI entry point for the CFS Cliff Lab
+
+- `labs/tlb_cliff/` - TLB Cliff Lab implementation
+  - `Cargo.toml` - Crate configuration
+  - `src/lib.rs` - Core implementation with CLI parsing, memory access patterns, and performance metrics
+  - `src/main.rs` - CLI entry point for the TLB Cliff Lab
+
+- `labs/numa_cliff/` - NUMA Cliff Lab implementation
+  - `Cargo.toml` - Crate configuration
+  - `src/lib.rs` - Core implementation with CLI parsing, memory access patterns, and performance metrics
+  - `src/main.rs` - CLI entry point for the NUMA Cliff Lab
+
+- `labs/perf_gate/` - Perf Stat Gate implementation
+  - `Cargo.toml` - Crate configuration
+  - `src/lib.rs` - Core implementation with CLI parsing and performance metrics
+  - `src/main.rs` - CLI entry point for the Perf Stat Gate
+
+### Scripts Created:
+- `scripts/epic2_test.sh` - Quick test script for all labs with minimal parameters
+- `scripts/epic2_run_all.sh` - Full test script for all labs with default parameters
+
+### Workspace Integration:
+- `Cargo.toml` - Updated to include all new crates in the workspace

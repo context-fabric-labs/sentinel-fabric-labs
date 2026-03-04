@@ -1,0 +1,14 @@
+{
+  "gpu_id": 0,
+  "requests": 1000,
+  "warmup_requests": 100,
+  "avg_seq_len": 512,
+  "concurrency": 8,
+  "wall_time_ms": 1.0,
+  "rps": 1000000.0,
+  "pressure_score": 55.2,
+  "memory_estimate": 16777216,
+  "cache_hit_rate": 67.4,
+  "pressure_level": "Medium",
+  "timestamp": 1772598603
+}

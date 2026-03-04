@@ -7,5 +7,9 @@ members = [
   "labs/cfs_cliff",
   "labs/tlb_cliff",
   "labs/numa_cliff",
-  "labs/perf_gate"
+  "labs/perf_gate",
+  "labs/gpu_exporter",
+  "labs/gpu_guardrail",
+  "labs/kv_pressure",
+  "labs/profiling_playbook"
 ]

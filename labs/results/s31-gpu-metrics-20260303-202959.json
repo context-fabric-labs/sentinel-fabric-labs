@@ -1,0 +1,14 @@
+{
+  "gpu_id": 0,
+  "requests": 1000,
+  "warmup_requests": 100,
+  "wall_time_ms": 1.0,
+  "rps": 1000000.0,
+  "utilization": 45.0,
+  "memory_utilization": 60.0,
+  "temperature": 65.0,
+  "power_usage": 150.0,
+  "memory_used": 1048576000,
+  "memory_total": 2097152000,
+  "timestamp": 1772598601
+}

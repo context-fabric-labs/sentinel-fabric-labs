@@ -1,0 +1,13 @@
+{
+  "tool": "nsight",
+  "requests": 1000,
+  "warmup_requests": 100,
+  "wall_time_ms": 1.0,
+  "rps": 1000000.0,
+  "methodology_score": 95.0,
+  "roofline_score": 88.0,
+  "perturbation_score": 90.0,
+  "comparability_score": 85.0,
+  "tool_recommendation": "Best for CUDA applications and detailed kernel analysis",
+  "timestamp": 1772598604
+}

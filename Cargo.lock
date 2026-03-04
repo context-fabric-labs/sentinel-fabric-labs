@@ -595,6 +595,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu_exporter"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hdrhistogram",
+ "num_cpus",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "gpu_guardrail"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hdrhistogram",
+ "num_cpus",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -984,6 +1009,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kv_pressure"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hdrhistogram",
+ "num_cpus",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,6 +1394,39 @@ checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "profiling_playbook"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hdrhistogram",
+ "num_cpus",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "prometheus"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "protobuf",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf"
+version = "2.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "quanta"
@@ -1915,7 +1985,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
