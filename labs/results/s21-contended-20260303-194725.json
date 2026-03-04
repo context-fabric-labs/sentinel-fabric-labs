@@ -1,0 +1,23 @@
+{
+  "mode": "contended",
+  "workers": 48,
+  "producers": 12,
+  "requests": 2000,
+  "warmup_requests": 1000,
+  "queue": 4096,
+  "work_us": 100,
+  "lock_hold_us": 1000,
+  "shards": 64,
+  "wall_time_ms": 2020.0,
+  "rps": 990.09900990099,
+  "p50_us": 12127,
+  "p95_us": 12151,
+  "p99_us": 12175,
+  "max_us": 23343,
+  "status_counts": {
+    "success": 2000,
+    "timeout": 0,
+    "error": 0
+  },
+  "timestamp": 1772596047
+}

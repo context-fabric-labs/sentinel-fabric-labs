@@ -1,0 +1,15 @@
+{
+  "access_type": "local",
+  "requests": 2000,
+  "warmup_requests": 1000,
+  "memory_size": 100000,
+  "wall_time_ms": 48.0,
+  "rps": 41666.666666666664,
+  "p50_us": 185,
+  "p95_us": 767,
+  "p99_us": 1053,
+  "max_us": 4983,
+  "remote_accesses": 0,
+  "cpu_migrations": 0,
+  "timestamp": 1772596049
+}

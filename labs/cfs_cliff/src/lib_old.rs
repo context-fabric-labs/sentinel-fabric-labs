@@ -83,8 +83,16 @@ pub struct StatusCounts {
     pub error: u64,
 }
 
+/// Task structure for the lab
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: u64,
+    pub timestamp: u64,
+}
+
 /// Shared state for the lab
 pub struct LabState {
+    pub queue: Arc<tokio::sync::Mutex<Vec<Task>>>,
     pub global_mutex: Arc<Mutex<u64>>,
     pub shards: Vec<Arc<Mutex<u64>>>,
     pub completed: AtomicU64,
@@ -101,6 +109,7 @@ impl LabState {
             .collect::<Vec<_>>();
         
         Self {
+            queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             global_mutex: Arc::new(Mutex::new(0u64)),
             shards,
             completed: AtomicU64::new(0),
@@ -136,64 +145,111 @@ pub async fn run_lab(args: Args) -> Result<CfsCliffResult, Box<dyn std::error::E
         args.workers
     };
     
-    let _producers = if args.producers == 0 {
+    let producers = if args.producers == 0 {
         num_cpus::get()
     } else {
         args.producers
     };
     
-    // Spawn worker tasks - simplified without queue
+    // Spawn producers
     let mut handles = Vec::new();
-    let total_requests = args.requests;
-    
-    for worker_id in 0..workers {
-        let state = state.clone();
-        let args = args.clone();
+    for i in 0..producers {
+        let queue = state.queue.clone();
+        let task_id = i as u64;
         let handle = tokio::spawn(async move {
-            let requests_per_worker = (total_requests / workers) + if worker_id < (total_requests % workers) { 1 } else { 0 };
-            
-            // Process assigned requests
-            for request_id in 0..requests_per_worker {
-                let start_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as u64;
+            let mut task_id = task_id;
+            for _ in 0..(args.requests / producers + 1) {
+                task_id += producers as u64;
+                let task = Task {
+                    id: task_id,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64,
+                };
+                
+                // Try to add to queue with timeout
+                let mut queue_guard = queue.lock().await;
+                if queue_guard.len() < args.queue {
+                    queue_guard.push(task);
+                }
+                drop(queue_guard);
                 
                 // Busy spin outside lock
                 busy_spin(args.work_us);
-                
-                // Critical section - lock contention
-                let lock_result: Result<(), Box<dyn std::error::Error>> = if args.mode == "sharded" {
-                    let shard_index = (worker_id + request_id) % args.shards;
-                    let _lock = state.shards[shard_index].lock().unwrap();
-                    busy_spin(args.lock_hold_us);
-                    Ok(())
-                } else {
-                    let _lock = state.global_mutex.lock().unwrap();
-                    busy_spin(args.lock_hold_us);
-                    Ok(())
+            }
+        });
+        handles.push(handle);
+    }
+    
+    // Spawn workers
+    for _ in 0..workers {
+        let state = state.clone();
+        let args = args.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                // Try to get a task from queue
+                let task = {
+                    let mut queue_guard = state.queue.lock().await;
+                    if queue_guard.is_empty() {
+                        drop(queue_guard);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    queue_guard.pop()
                 };
                 
-                let end_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as u64;
-                
-                // Record timing
-                let latency = end_time - start_time;
-                {
-                    let mut histogram = state.histogram.lock().unwrap();
-                    let _ = histogram.record(latency);
-                }
-                
-                // Update counters
-                if lock_result.is_ok() {
-                    state.success_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(task) = task {
+                    // Process task
+                    let start_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64;
+                    
+                    // Busy spin outside lock
+                    busy_spin(args.work_us);
+                    
+                    // Critical section - lock contention
+                    let lock_result: Result<(), Box<dyn std::error::Error>> = if args.mode == "sharded" {
+                        let shard_index = (task.id % args.shards as u64) as usize;
+                        let _lock = state.shards[shard_index].lock().unwrap();
+                        busy_spin(args.lock_hold_us);
+                        Ok(())
+                    } else {
+                        let _lock = state.global_mutex.lock().unwrap();
+                        busy_spin(args.lock_hold_us);
+                        Ok(())
+                    };
+                    
+                    let end_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64;
+                    
+                    // Record timing
+                    let latency = end_time - start_time;
+                    {
+                        let mut histogram = state.histogram.lock().unwrap();
+                        histogram.record(latency).unwrap();
+                    }
+                    
+                    // Update counters
+                    if lock_result.is_ok() {
+                        state.success_count.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        state.error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    
+                    state.completed.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    state.error_count.fetch_add(1, Ordering::Relaxed);
+                    // No tasks, sleep briefly
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 
-                state.completed.fetch_add(1, Ordering::Relaxed);
+                // Check if we've completed all requests
+                if state.completed.load(Ordering::Relaxed) >= args.requests as u64 {
+                    break;
+                }
             }
         });
         handles.push(handle);
@@ -217,7 +273,7 @@ pub async fn run_lab(args: Args) -> Result<CfsCliffResult, Box<dyn std::error::E
     let result = CfsCliffResult {
         mode: args.mode,
         workers,
-        producers: _producers,
+        producers,
         requests: args.requests,
         warmup_requests: args.warmup_requests,
         queue: args.queue,
@@ -248,13 +304,16 @@ pub async fn run_lab(args: Args) -> Result<CfsCliffResult, Box<dyn std::error::E
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_busy_spin() {
+    #[tokio::test]
+    async fn test_busy_spin() {
+        // Test that busy_spin returns quickly when 0
         busy_spin(0);
+        // Should complete without blocking
     }
 
-    #[test]
-    fn test_sharding_logic() {
+    #[tokio::test]
+    async fn test_sharding_logic() {
+        // Test that sharding logic is stable
         let shards = 64;
         let id = 12345u64;
         let shard_index = (id % shards as u64) as usize;
@@ -262,7 +321,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_json_serialization() {
+        // Test that result can be serialized/deserialized
+        let result = CfsCliffResult {
+            mode: "contended".to_string(),
+            workers: 4,
+            producers: 2,
+            requests: 1000,
+            warmup_requests: 100,
+            queue: 1024,
+            work_us: 100,
+            lock_hold_us: 1000,
+            shards: 64,
+            wall_time_ms: 100.0,
+            rps: 10000.0,
+            p50_us: 1000,
+            p95_us: 2000,
+            p99_us: 3000,
+            max_us: 5000,
+            status_counts: StatusCounts {
+                success: 950,
+                timeout: 25,
+                error: 25,
+            },
+            timestamp: 1234567890,
+        };
+        
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: CfsCliffResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result.mode, parsed.mode);
+        assert_eq!(result.p99_us, parsed.p99_us);
+    }
+
+    #[tokio::test]
     async fn test_smoke_simulation() {
+        // Smoke test with small parameters
         let args = Args {
             mode: "contended".to_string(),
             workers: 2,
@@ -278,8 +371,13 @@ mod tests {
         
         let result = run_lab(args).await.unwrap();
         
+        // Verify basic properties
         assert!(result.wall_time_ms > 0.0);
         assert!(result.rps > 0.0);
+        assert!(result.p50_us > 0);
+        assert!(result.p95_us > 0);
+        assert!(result.p99_us > 0);
+        assert!(result.max_us > 0);
         assert!(result.status_counts.success > 0);
     }
 }

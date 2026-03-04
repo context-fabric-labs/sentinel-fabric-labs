@@ -1,0 +1,15 @@
+{
+  "access_type": "remote",
+  "requests": 2000,
+  "warmup_requests": 1000,
+  "memory_size": 100000,
+  "wall_time_ms": 48.0,
+  "rps": 41666.666666666664,
+  "p50_us": 184,
+  "p95_us": 747,
+  "p99_us": 924,
+  "max_us": 3273,
+  "remote_accesses": 2000,
+  "cpu_migrations": 0,
+  "timestamp": 1772596049
+}

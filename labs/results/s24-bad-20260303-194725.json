@@ -1,0 +1,13 @@
+{
+  "run_type": "bad",
+  "requests": 10000,
+  "warmup_requests": 500,
+  "wall_time_ms": 13.0,
+  "rps": 769230.7692307692,
+  "context_switches": 504,
+  "cpu_migrations": 504,
+  "task_clock": 118227,
+  "cycles": 769230769,
+  "instructions": 10000,
+  "timestamp": 1772596049
+}

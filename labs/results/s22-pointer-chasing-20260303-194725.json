@@ -1,0 +1,15 @@
+{
+  "access_pattern": "pointer-chasing",
+  "requests": 2000,
+  "warmup_requests": 1000,
+  "array_size": 100000,
+  "wall_time_ms": 6.0,
+  "rps": 333333.3333333333,
+  "p50_us": 3,
+  "p95_us": 4,
+  "p99_us": 21,
+  "max_us": 60,
+  "tlb_misses": 0,
+  "page_walks": 0,
+  "timestamp": 1772596048
+}

@@ -1,0 +1,13 @@
+{
+  "run_type": "fixed",
+  "requests": 10000,
+  "warmup_requests": 500,
+  "wall_time_ms": 17.0,
+  "rps": 588235.294117647,
+  "context_switches": 0,
+  "cpu_migrations": 0,
+  "task_clock": 133030,
+  "cycles": 588235294,
+  "instructions": 10000,
+  "timestamp": 1772596049
+}

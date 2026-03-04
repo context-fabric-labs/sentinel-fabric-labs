@@ -4,5 +4,8 @@ members = [
   "sentinel",
   "tools/upstream_stub",
   "bench",
-  "labs/cfs_cliff"
+  "labs/cfs_cliff",
+  "labs/tlb_cliff",
+  "labs/numa_cliff",
+  "labs/perf_gate"
 ]

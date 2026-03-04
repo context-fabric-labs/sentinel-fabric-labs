@@ -1,0 +1,15 @@
+{
+  "access_pattern": "contiguous",
+  "requests": 2000,
+  "warmup_requests": 1000,
+  "array_size": 100000,
+  "wall_time_ms": 4.0,
+  "rps": 500000.0,
+  "p50_us": 14,
+  "p95_us": 35,
+  "p99_us": 52,
+  "max_us": 73,
+  "tlb_misses": 0,
+  "page_walks": 0,
+  "timestamp": 1772596048
+}
