@@ -1,0 +1,15 @@
+# Bench Docker Compose for local testing
+version: '3.8'
+
+services:
+  bench:
+    build:
+      context: ../..
+      dockerfile: containers/bench/Dockerfile
+    environment:
+      - RUST_LOG=debug
+      - SENTINEL_URL=http://host.docker.internal:8080
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./output:/app/output

@@ -1,0 +1,20 @@
+# Sentinel Docker Compose for local testing
+version: '3.8'
+
+services:
+  sentinel:
+    build:
+      context: ../..
+      dockerfile: containers/sentinel/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=debug
+      - UPSTREAM_URL=http://host.docker.internal:4000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

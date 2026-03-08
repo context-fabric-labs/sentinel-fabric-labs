@@ -1,0 +1,60 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Build artifacts
+target/
+**/target/
+*.o
+*.so
+*.dylib
+
+# Test artifacts
+*.profraw
+*.profdata
+coverage/
+*.gcno
+*.gcda
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Scripts (not needed for build)
+scripts/
+infra/
+deploy/
+
+# Kubernetes manifests
+k8s/
+
+# Test data
+test_data/
+fixtures/
+
+# Docker
+Dockerfile*
+docker-compose*
+.docker/
+
+# Misc
+*.tmp
+*.temp
+.cache

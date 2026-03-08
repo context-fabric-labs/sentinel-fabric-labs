@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench
+  namespace: sentinel-fabric
+  labels:
+    app.kubernetes.io/name: bench
+    app.kubernetes.io/component: benchmark
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bench
+      annotations:
+        # IRSA annotation - replace with your actual IAM role ARN
+        # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/bench-s3-role
+    spec:
+      serviceAccountName: bench-sa
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: bench:latest
+          imagePullPolicy: IfNotPresent
+          command: ["./bench"]
+          args:
+            - "run"
+            - "--scenario=health"
+            - "--url=http://sentinel:8080/health"
+            - "--concurrency=32"
+            - "--requests=2000"
+            - "--out=/tmp/bench/results.json"
+            # Uncomment and configure for S3 upload:
+            # - "--s3-bucket=my-bench-results-bucket"
+            # - "--s3-prefix=bench-results/"
+            - "--upload-with-aws-cli=true"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          env:
+            - name: SENTINEL_URL
+              value: "http://sentinel:8080"
+            - name: RUST_LOG
+              value: "info"
+            # Optional: Override S3 bucket via environment
+            # - name: S3_BUCKET
+            #   value: "my-bench-results-bucket"
+          volumeMounts:
+            - name: bench-output
+              mountPath: /tmp/bench
+      volumes:
+        - name: bench-output
+          emptyDir: {}

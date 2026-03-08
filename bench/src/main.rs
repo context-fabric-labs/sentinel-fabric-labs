@@ -63,6 +63,18 @@ enum Cmd {
         /// Optional output path. If omitted, writes to bench/results/<scenario>-<ts>.json
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// Optional S3 bucket name for uploading results
+        #[arg(long)]
+        s3_bucket: Option<String>,
+
+        /// S3 prefix for results (default: sentinel-fabric/bench/)
+        #[arg(long, default_value = "sentinel-fabric/bench/")]
+        s3_prefix: String,
+
+        /// Use AWS CLI for upload (default: true, set to false to use Rust SDK)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        upload_with_aws_cli: bool,
     },
 
     /// Pretty-print a JSON result
@@ -121,9 +133,12 @@ async fn main() -> Result<()> {
             body_file,
             body_json,
             out,
+            s3_bucket,
+            s3_prefix,
+            upload_with_aws_cli,
         } => {
             let res = run_bench(
-                scenario,
+                scenario.clone(),
                 url,
                 concurrency,
                 requests,
@@ -141,6 +156,11 @@ async fn main() -> Result<()> {
             std::fs::write(&out_path, serde_json::to_vec_pretty(&res)?)?;
             println!("wrote {:?}", out_path);
             print_summary(&res);
+
+            // Upload to S3 if bucket is specified
+            if let Some(bucket) = s3_bucket {
+                upload_to_s3(&out_path, &bucket, &s3_prefix, upload_with_aws_cli)?;
+            }
         }
         Cmd::Report { file } => {
             let bytes = std::fs::read(&file)?;
@@ -357,4 +377,183 @@ fn print_summary(res: &BenchResult) {
         res.latency_us.max,
         res.wall_time_ms
     );
+}
+
+fn upload_to_s3(
+    file_path: &PathBuf,
+    bucket: &str,
+    prefix: &str,
+    use_aws_cli: bool,
+) -> Result<()> {
+    let filename = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("results.json");
+    
+    let s3_key = format!("{}{}", prefix.trim_end_matches('/'), filename);
+    
+    if use_aws_cli {
+        // Use AWS CLI v2 for upload
+        println!("Uploading {} to s3://{}/{} using AWS CLI...", file_path.display(), bucket, s3_key);
+        
+        let status = Command::new("aws")
+            .args([
+                "s3",
+                "cp",
+                file_path.to_str().unwrap(),
+                &format!("s3://{}/{}", bucket, s3_key),
+            ])
+            .status()
+            .with_context(|| "Failed to execute aws s3 cp command")?;
+        
+        if !status.success() {
+            anyhow::bail!("AWS CLI upload failed with exit code: {:?}", status.code());
+        }
+        
+        println!("Successfully uploaded to s3://{}/{}", bucket, s3_key);
+    } else {
+        // Use Rust AWS SDK (placeholder - would require aws-sdk-s3 dependency)
+        println!("Rust SDK upload not yet implemented. Use --upload-with-aws-cli=true");
+        anyhow::bail!("Rust SDK upload requires aws-sdk-s3 dependency");
+    }
+    
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_with_s3_args() {
+        let args = Cli::parse_from([
+            "bench",
+            "run",
+            "--scenario",
+            "health",
+            "--url",
+            "http://localhost:8080/health",
+            "--s3-bucket",
+            "my-bucket",
+            "--s3-prefix",
+            "test-prefix/",
+        ]);
+        
+        match args.cmd {
+            Cmd::Run { s3_bucket, s3_prefix, .. } => {
+                assert_eq!(s3_bucket, Some("my-bucket".to_string()));
+                assert_eq!(s3_prefix, "test-prefix/");
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_without_s3_args() {
+        let args = Cli::parse_from([
+            "bench",
+            "run",
+            "--scenario",
+            "health",
+            "--url",
+            "http://localhost:8080/health",
+        ]);
+        
+        match args.cmd {
+            Cmd::Run { s3_bucket, s3_prefix, .. } => {
+                assert_eq!(s3_bucket, None);
+                assert_eq!(s3_prefix, "sentinel-fabric/bench/");
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_upload_with_aws_cli_default() {
+        let args = Cli::parse_from([
+            "bench",
+            "run",
+            "--scenario",
+            "health",
+            "--url",
+            "http://localhost:8080/health",
+            "--s3-bucket",
+            "my-bucket",
+        ]);
+        
+        match args.cmd {
+            Cmd::Run { upload_with_aws_cli, .. } => {
+                assert_eq!(upload_with_aws_cli, true);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_upload_with_aws_cli_explicit_false() {
+        // Use explicit false value with ArgAction::Set
+        let args = Cli::parse_from([
+            "bench",
+            "run",
+            "--scenario",
+            "health",
+            "--url",
+            "http://localhost:8080/health",
+            "--s3-bucket",
+            "my-bucket",
+            "--upload-with-aws-cli=false",
+        ]);
+        
+        match args.cmd {
+            Cmd::Run { upload_with_aws_cli, .. } => {
+                assert_eq!(upload_with_aws_cli, false);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_s3_prefix_default() {
+        let args = Cli::parse_from([
+            "bench",
+            "run",
+            "--scenario",
+            "health",
+            "--url",
+            "http://localhost:8080/health",
+            "--s3-bucket",
+            "my-bucket",
+        ]);
+        
+        match args.cmd {
+            Cmd::Run { s3_prefix, .. } => {
+                assert_eq!(s3_prefix, "sentinel-fabric/bench/");
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_s3_prefix_custom() {
+        let args = Cli::parse_from([
+            "bench",
+            "run",
+            "--scenario",
+            "health",
+            "--url",
+            "http://localhost:8080/health",
+            "--s3-bucket",
+            "my-bucket",
+            "--s3-prefix",
+            "custom/prefix/path/",
+        ]);
+        
+        match args.cmd {
+            Cmd::Run { s3_prefix, .. } => {
+                assert_eq!(s3_prefix, "custom/prefix/path/");
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
 }

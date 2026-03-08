@@ -1,0 +1,37 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sentinel-fabric
+
+resources:
+- ../../base
+- ../../sentinel
+- ../../upstream_stub
+  # Note: bench job is not included by default
+  # To run bench, use: kubectl apply -k k8s/bench/
+
+commonLabels:
+  app.kubernetes.io/environment: dev
+
+commonAnnotations:
+  description: Development overlay for sentinel-fabric platform
+
+# Image configuration - easily override with ECR URIs
+# Example: kustomize edit set image sentinel=<ECR_URI>:<TAG>
+images:
+- name: bench
+  newName: 545009852657.dkr.ecr.us-east-1.amazonaws.com/sentinel-fabric/bench
+  newTag: latest
+- name: sentinel
+  newName: 545009852657.dkr.ecr.us-east-1.amazonaws.com/sentinel-fabric/sentinel
+  newTag: latest
+- name: upstream_stub
+  newName: 545009852657.dkr.ecr.us-east-1.amazonaws.com/sentinel-fabric/upstream_stub
+  newTag: latest
+
+# ConfigMap for development configuration
+configMapGenerator:
+- literals:
+  - ENVIRONMENT=dev
+  - LOG_LEVEL=debug
+  name: dev-config
