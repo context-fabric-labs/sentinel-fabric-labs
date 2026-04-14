@@ -266,6 +266,29 @@ This epic implements four systems physics labs that demonstrate various aspects 
   - `Cargo.toml` - Crate configuration
   - `src/lib.rs` - Core implementation with CLI parsing and performance metrics
   - `src/main.rs` - CLI entry point for the Perf Stat Gate
+ 
+  - ===
+Exp-1
+San Jose, CA
+•	Leading design of a real-time MEV defense and arbitrage platform for digital-asset and payment-adjacent liquidity workflows, using agentic AI patterns to monitor mempool shifts, propose execution actions, and enforce deterministic trade-protection policies.
+•	Built a low-latency ingest and decision pipeline that collects pending-transaction telemetry from distributed blockchain nodes and routes signals to simulation, policy, and execution services under strict p99 latency budgets.
+•	Implemented a Helios / Myelin style execution fabric that runs parallel threat simulations and execution-quality scoring to detect sandwich-attack and frontrun risk, then automatically cancels, reroutes to private execution paths, or hedges before public mempool exposure.
+•	Added benchmark-driven reliability controls including admission limits, queue bounds, tracing, replayable test harnesses, failure injection, and SLO-aware routing to harden mission-critical flows.
+•	Introduced agentic operations workflows that combine market telemetry, execution policies, fraud / abuse heuristics, and post-trade analysis to reduce manual intervention and accelerate response during volatile conditions. Used CUDA for parallel simulation and threat scoring
+Technical Stack: Rust, Python, streaming data services, GPU-oriented simulation concepts, Kubernetes, Docker, Prometheus/Grafana, OpenTelemetry, Linux, AWS, private RPC / protected execution routing
+<img width="468" height="230" alt="image" src="https://github.com/user-attachments/assets/56d0e4ee-fa0b-4bd9-9fbb-40bbe08ac601" />
+
+Exp-2
+San Jose, CA
+•	Architected fraud decisioning and risk-scoring platforms for credit-card authorization, transaction enrichment, account takeover detection, and investigator workflows across high-volume payment flows.
+•	Designed and built Project Sentinel, an internal distributed inference-serving and control fabric for fraud scoring—combining a Rust/Python gateway, benchmark harness, policy engine, and health-aware routing layer to coordinate model endpoints, feature services, caches, and fallback paths under regulated low-latency constraints.
+•	Built custom CUDA kernels for fraud-scoring primitives, KV-cache or memory-layout tuning, GPU batching/stream concurrency, profiling p95/p99 bottlenecks, reducing host-device copies, optimizing utilization under bursty traffic..
+•	Implemented admission control, concurrency limits, queue backpressure, circuit breaking, shadow traffic, canary releases, and fail-open / fail-safe behaviors so model and rules changes could be introduced without destabilizing card-transaction flows.
+•	Built observability and performance tooling around p50/p95/p99 latency, throughput, dependency health, error budgets, and queue depth, creating an evidence-driven workflow for scaling fraud models in Kubernetes and cloud environments.
+•	Advanced the platform toward NVIDIA Dynamo-like patterns for enterprise scope, including intelligent routing, tiered caching, warm pools, autoscaling, and policy-aware orchestration for inference services used by fraud and investigation teams.
+•	Partnered with fraud analytics, platform, data engineering, and security teams to align model serving, compliance, operational resilience, and cost controls across production and pre-production environments.
+Technical Stack: Rust, C++, Python, Go, Kubernetes / EKS, Docker, Kafka, Redis, RocksDB, gRPC/Protobuf, Apache Arrow, Prometheus/Grafana, OpenTelemetry, Linux, cloud-native inference patterns and benchmark-driven operations
+<img width="468" height="336" alt="image" src="https://github.com/user-attachments/assets/431713d9-5d39-442e-8294-cd3f5776b885" />
 
 ### Scripts Created:
 - `scripts/epic2_test.sh` - Quick test script for all labs with minimal parameters
