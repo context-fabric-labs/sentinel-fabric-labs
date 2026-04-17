@@ -1,0 +1,793 @@
+# Advanced Use Case — Ultra-Low-Latency Payment Processing with Three-Tier Agentic AI
+
+**Section I — Optional Advanced Topic**
+
+This document describes a systems-level architecture for a large credit-card issuer (Chase, Capital One scale) that layers Agentic AI onto a high-throughput payment platform. The design is organized into three tiers, each with a distinct latency SLA and purpose. Sentinel, Helios, and a zero-copy Rust/CUDA data plane work together to satisfy all three simultaneously.
+
+---
+
+## The Problem
+
+A tier-1 credit-card issuer processes tens of thousands of transactions per second with strict contractual SLAs: p99 authorization latency in the low milliseconds, 99.999% uptime, and zero tolerance for double-processing or dropped transactions.
+
+When you add AI-driven fraud scoring, real-time failure reasoning, and automated triage, you introduce workloads that differ wildly in cost, latency, and memory profile. Without a disciplined three-tier architecture, these workloads will interfere with each other and jeopardize the core authorization path.
+
+The system must deliver three things at once:
+
+| Tier | Purpose | Latency SLA | Output |
+|------|---------|-------------|--------|
+| **Tier 1 — Transaction Decisioning** | Fraud detection and approval | **< 5 ms p99** (millisecond-class) | Binary Go / No-Go classification |
+| **Tier 2 — Failure Reasoning** | Analyze No-Go transactions | **2–5 seconds p99** | Structured decline explanation |
+| **Tier 3 — Quick Triage** | Kickstart remediation actions | **5–10 seconds p99** | Triage plan + action dispatch |
+
+Each tier places fundamentally different demands on compute, memory, data movement, and model complexity. The design must isolate them while enabling efficient data flow between them.
+
+---
+
+## The Core Design Principle
+
+**Keep the three tiers physically and logically separated, but let data flow between them without rebuilding or reserializing.**
+
+- Tier 1 is an in-process, per-core, zero-copy scoring pipeline in Rust. No generative models. No network hops on the hot path.
+- Tier 2 is a fast inference path with a compact reasoning model behind Sentinel. It receives structured context from Tier 1 without re-parsing.
+- Tier 3 is a deeper agentic workflow behind Sentinel and Helios. It consumes the same shared event representation as Tier 2 and orchestrates downstream actions.
+
+The unifying mechanism is a shared, immutable, Arrow-compatible event representation published once at the boundary of Tier 1 and consumed zero-copy by Tiers 2 and 3.
+
+---
+
+## High-Level Architecture
+
+```mermaid
+graph TB
+    subgraph "Ingress"
+        NIC[Network / TLS Termination]
+    end
+
+    subgraph "Tier 1 — Transaction Decisioning  < 5 ms"
+        SLAB[Per-Core Request Slab / Arena]
+        PARSE[TxnView — Zero-Copy Parse]
+        FEAT[Shared Feature Block]
+        CPU_SCORE[CPU Scorers: XGBoost, GBDT, Scorecards, Rules, Velocity]
+        GPU_SCORE[GPU Scorer: Distilled Neural Model]
+        ENSEMBLE[Weighted Ensemble — Go / No-Go]
+    end
+
+    subgraph "Shared Event Bus"
+        ARROW[Arrow-Compatible Immutable Event Buffer]
+    end
+
+    subgraph "Tier 2 — Failure Reasoning  2-5 sec"
+        SENT2[Sentinel Gateway]
+        REASON[Fast Reasoning Model]
+        ENRICH2[Feature Store + History Enrichment]
+    end
+
+    subgraph "Tier 3 — Quick Triage  5-10 sec"
+        SENT3[Sentinel Gateway]
+        HEL3[Helios Scheduler]
+        TRIAGE[Triage Agent — Multi-Step Reasoning]
+        TOOLS[Tool Adapters: Case System, Alerts, Runbooks, Analyst Queue]
+    end
+
+    NIC --> SLAB
+    SLAB --> PARSE
+    PARSE --> FEAT
+    FEAT --> CPU_SCORE
+    FEAT --> GPU_SCORE
+    CPU_SCORE --> ENSEMBLE
+    GPU_SCORE --> ENSEMBLE
+    ENSEMBLE --> ARROW
+
+    ARROW --> SENT2
+    SENT2 --> REASON
+    ARROW --> ENRICH2
+    ENRICH2 --> REASON
+
+    ARROW --> SENT3
+    SENT3 --> HEL3
+    HEL3 --> TRIAGE
+    TRIAGE --> TOOLS
+```
+
+---
+
+## Tier 1 — Ultra-Low-Latency Transaction Decisioning
+
+### What It Does
+
+Every incoming credit-card authorization flows through this tier. The output is a binary Go / No-Go decision with a composite fraud score, a confidence level, and a compact reason stub. The latency target is millisecond-class (p99 < 5 ms).
+
+### Scoring Ensemble
+
+The decisioning system produces a weighted composite score from multiple models:
+
+| Model Type | Examples | Runtime | Role |
+|-----------|---------|---------|------|
+| **Tabular / GBDT** | XGBoost, LightGBM, CatBoost | CPU | Transaction-level fraud signals, merchant risk, velocity anomalies |
+| **Linear / Scorecard** | Logistic regression, calibrated scorecards | CPU | Regulatory-mandated risk factors, issuer rules |
+| **Business Rules** | Rule engine, heuristic thresholds | CPU | Hard limits, sanctions, geo-blocks, card-not-present flags |
+| **Compact Neural** | Distilled MLP, embedding-interaction network, compact transformer classifier | GPU | Learned cross-feature interactions, device/merchant semantic similarity |
+
+All models read from the **same shared feature block**. No per-model feature reconstruction.
+
+### Zero-Copy Architecture
+
+For a millisecond SLA, the enemy is not FLOPS — it is unnecessary memory copies, serialization, allocation churn, cache misses, cross-core migration, and host-device staging bounces. The design principle:
+
+> **Parse once. Normalize once. Reference by pointer/offset for the rest of the hot path.**
+
+#### A. Ingress Parsing — Parse Once, Never Rebuild
+
+The request payload is parsed into a canonical transaction view using borrowed references into a preallocated per-core memory slab. No new `String` allocations. No generic hash maps. Variable-length fields (merchant descriptor, device blob, user signal) are stored as offset+length views into the original slab.
+
+```rust
+struct TxnView<'a> {
+    card_bin: u32,
+    merchant_id: u64,
+    amount_minor: i64,
+    currency: u16,
+    country_code: u16,
+    mcc: u16,
+    device_id_hash: u64,
+    merchant_desc: &'a [u8],     // offset into slab, not a copy
+    device_blob: &'a [u8],
+    tokenized_user_signal: &'a [u8],
+    retry_count: u8,
+    channel: u8,                  // POS / CNP / e-commerce / recurring
+}
+```
+
+#### B. Feature Engineering — Views, Not Copies
+
+Features are split into two categories, both read from the same memory:
+
+**Fixed-width numeric features** — amount, velocity counters, hour-of-day, card age, merchant risk score, geo distance, retry count, issuer aggregates. These live in one cacheline-aligned, contiguous struct reusable across all models.
+
+**Categorical / text features** — merchant descriptor, device signature, memo text, user agent fragments. These are represented as dictionary IDs, offsets into immutable buffers, or precomputed cached embeddings — not parsed strings.
+
+**Critical design choice:** For Tier 1, do not do heavy online text preprocessing. Instead:
+
+- Precompute and cache merchant/device/user embeddings offline or nearline.
+- Fetch the embedding vector directly in the hot path.
+- Score with a lightweight MLP / dot product / interaction network.
+- Only run online tokenization for unseen merchants or rare edge cases.
+
+This alone is often a bigger latency win than any low-level zero-copy trick.
+
+#### C. CPU Model Scoring — One Feature Block, Many Scorers
+
+All CPU-side scorers (XGBoost, GBDT, linear, scorecard, rules) read from the same dense aligned feature block via pointer/span. No per-model conversion to JSON, maps, or dictionaries.
+
+```
+Canonical TxnView
+  → FeatureVectorView (numeric block + categorical IDs + offset refs)
+  → 8–20 scorers read from the exact same memory
+  → weighted aggregation
+  → Go / No-Go
+```
+
+#### D. GPU Model Invocation — Pinned Buffers, Preallocated Everything
+
+If a compact neural model runs on GPU in Tier 1:
+
+| Technique | Purpose |
+|-----------|---------|
+| **Preallocated pinned host memory** | Per-worker pinned input/output buffers eliminate pageable→pinned staging copies |
+| **cudaMemcpyAsync on dedicated CUDA streams** | Overlaps host-to-device transfer with compute |
+| **Preloaded model weights, fixed execution context** | No per-request graph construction or memory allocation |
+| **Micro-batching with tiny bounded window** | Tens-to-hundreds of microseconds; fixed upper bound on batch size; immediate launch fallback under low load |
+| **CUDA Graphs** | For fixed-shape tensor pipelines, removes repeated kernel launch overhead |
+| **Precomputed embeddings** | Merchant / device / user embeddings fetched from in-memory store, not computed online |
+
+**Pattern:**
+
+```
+Worker builds TxnView / FeatureVectorView
+  → writes GPU-required subset directly into preallocated pinned batch slot
+  → publishes descriptor to GPU submit queue
+  → GPU dispatcher launches async copy + kernel on stream
+  → writes compact score output to preallocated output slot
+  → worker aggregates GPU score with CPU scores
+```
+
+The GPU is only worth using in Tier 1 for models that materially improve fraud signal **and** can stay within strict tail-latency bounds. Full reasoning or generative models do not belong here.
+
+#### E. Ring Buffer Strategy — Descriptors, Not Payloads
+
+Ring buffers carry compact descriptors, never full transaction bytes:
+
+```
+{ slab_id, offset, length, feature_block_ptr, deadline_ts, trace_id }
+```
+
+- Ingress writes once into slab. Downstream stages read by reference.
+- SPSC (single-producer, single-consumer) per-core rings wherever possible.
+- Cacheline-aligned producer/consumer indices. Power-of-two capacities.
+- Avoid generic MPMC unless genuinely required.
+
+**Pattern:** Each transaction is owned by a single hot-path worker from ingress through decision. No bouncing between cores.
+
+#### F. Per-Core Memory Architecture
+
+Each worker core owns:
+
+- Request slab / arena
+- Fixed-width feature arena
+- Output score arena
+- Ring buffer descriptors
+- Pinned host-to-device staging buffers (if GPU-connected)
+
+**Why:** Avoids allocator contention, improves cache locality, prevents cross-core ownership, enables SPSC queues, and makes reclamation trivial (bulk arena reset after each request).
+
+#### G. Rust-Specific Hot-Path Patterns
+
+| Pattern | Why |
+|---------|-----|
+| Borrowed lifetimes (`&[u8]`, `Bytes`) on ingress | No heap allocation for field parsing |
+| Arena-backed request objects with bulk reset | No per-field deallocation |
+| Lock-free SPSC queues with per-core ownership | Ownership discipline enforced by the type system |
+| Zero-copy serialization (Arrow IPC, FlatBuffers) only at process boundaries | Hot inner loop uses fixed-layout structs |
+
+### Tier 1 Hot-Path Summary
+
+```
+Stage 0 — Ingress / TLS / protocol termination
+  → assign request to worker by hash (card / account / device / merchant)
+  → write request into worker-local slab
+  → publish descriptor only
+
+Stage 1 — Canonical TxnView
+  → parse fixed-width fields once
+  → variable-length fields remain borrowed views into slab
+
+Stage 2 — Feature Block
+  → numeric features in aligned struct/array
+  → categorical features as IDs
+  → fetch precomputed embeddings from in-memory cache
+
+Stage 3 — CPU Fast Scorers
+  → scorecards, XGBoost, GBDT, linear calibration, rules, velocity lookups
+  → all read from the same feature block
+  → often sufficient to decide without GPU
+
+Stage 4 — Optional GPU Branch
+  → only if CPU ensemble confidence is below threshold
+  → pinned buffer → micro-batch → async H2D → preloaded kernel → score
+  → strict timeout; fail-open or fail-safe per risk tier
+
+Stage 5 — Decision + Publish
+  → final weighted score
+  → binary Go / No-Go
+  → compact reason stub / code
+  → confidence level
+  → route metadata
+  → publish into shared immutable Arrow event buffer
+```
+
+---
+
+## Apache Arrow at the Tier Boundary
+
+### Where Arrow Fits — And Where It Does Not
+
+**Arrow is not the primary format inside Tier 1's innermost single-request loop.** A custom, cache-optimized, fixed-width Rust feature block is simpler and faster there.
+
+**Arrow becomes extremely valuable at the publish boundary** — the moment Tier 1 produces a decision and needs to hand context to Tiers 2 and 3 without reserializing.
+
+### Shared Event Schema
+
+```
+txn_id:                 fixed_binary(16)
+timestamp_ns:           int64
+card_bin:               uint32
+merchant_id:            uint64
+amount_minor:           int64
+currency:               uint16
+mcc:                    uint16
+country_code:           uint16
+device_id_hash:         uint64
+channel:                uint8
+merchant_desc_offsets:  offsets
+merchant_desc_values:   bytes
+feature_vector:         fixed_size_list<float32>
+model_scores:           fixed_size_list<float32>
+final_score:            float32
+decision:               uint8          (GO=0, NO_GO=1)
+confidence:             float32
+reason_stub_code:       uint16
+route_flags:            uint32
+trace_id:               fixed_binary(16)
+```
+
+Fixed-width where possible. Offsets for variable-length fields. Dictionary-encoded categoricals.
+
+### Zero-Copy Arrow Patterns
+
+1. **Wrap existing memory as Arrow buffers.** If Tier 1 already has the feature block, string slab, and score array in contiguous memory, expose them as Arrow arrays via the C Data Interface. Arrow becomes the view layer, not the copy layer.
+
+2. **Shared-memory / mmap event segments.** Tier 2 and Tier 3 consumers read the same physical bytes without deserialization.
+
+3. **Columnar micro-batches for GPU input.** When the GPU branch uses a tiny bounded batch, represent columns in Arrow-compatible contiguous buffers and feed them directly into pre-tokenized/embedding-lookup kernels.
+
+---
+
+## Tier 2 — Low-Latency Failure Reasoning
+
+### What It Does
+
+When Tier 1 produces a No-Go, Tier 2 immediately begins analyzing the decline. The latency target is 2–5 seconds. The output is a structured explanation: why the transaction was declined, which model(s) triggered the decision, and any contextual signals that contributed.
+
+### How It Works
+
+1. **No re-parsing.** Tier 2 reads the same Arrow event buffer published by Tier 1. All transaction fields, feature vectors, model scores, and the reason stub are already present.
+2. **Enrichment.** A lightweight enrichment step fetches additional context from the in-memory feature store, recent transaction history, and merchant profile cache. This is append-only — no mutation of the Tier 1 event.
+3. **Fast reasoning model.** A compact model (distilled 7B–13B class) running behind Sentinel receives a structured evidence pack:
+   - the Tier 1 feature vector and model scores
+   - the enriched context
+   - a focused prompt template for decline reasoning
+4. **Sentinel controls.** Token admission control, bounded queue, circuit breaker, and SSE streaming protect this path from overload during decline spikes.
+
+### Sentinel Configuration for Tier 2
+
+```yaml
+apiVersion: inference.sentinel.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: decline-reasoner
+  namespace: ai-inference
+spec:
+  model: payment/decline-reasoner-13b
+  gpuCount: 2
+  replicas: 4
+  slo:
+    p99LatencyMs: 4000
+    maxErrorRate: 0.005
+  tokenBudget: 40000
+  sentinel:
+    enabled: true
+    circuitBreakerThreshold: 0.3
+    queueSize: 200
+    priorityLanes:
+      P0: high-value-decline      # > $5,000 or flagged merchant
+      P1: standard-decline
+  scaling:
+    minReplicas: 4
+    maxReplicas: 16
+    metrics:
+      - type: custom
+        name: sentinel_p99_latency_ms
+        target: 3000
+      - type: custom
+        name: sentinel_queue_depth
+        target: 50
+```
+
+### Output Format
+
+```json
+{
+  "txn_id": "a1b2c3d4-...",
+  "decision": "NO_GO",
+  "explanation": {
+    "primary_trigger": "velocity_anomaly",
+    "contributing_models": [
+      {"name": "xgboost_v3", "score": 0.87, "weight": 0.3},
+      {"name": "device_similarity_nn", "score": 0.91, "weight": 0.25}
+    ],
+    "context_signals": [
+      "5 transactions in 90 seconds from distinct geolocations",
+      "device fingerprint not seen with this card previously"
+    ],
+    "confidence": 0.92,
+    "recommended_action": "TRIAGE_ESCALATE"
+  }
+}
+```
+
+This structured output is immediately consumable by Tier 3 without additional interpretation.
+
+---
+
+## Tier 3 — Quick Triage
+
+### What It Does
+
+Tier 3 takes the No-Go decision, the Tier 2 explanation, and kicks off a triage workflow within 5–10 seconds. This might mean: auto-blocking the card, sending a customer notification, opening a fraud case, routing to a human analyst queue, or triggering a secondary verification flow.
+
+### How It Works
+
+1. **Consumes the same Arrow event.** Tier 3 reads the shared event buffer and the Tier 2 explanation.
+2. **Agentic workflow behind Sentinel + Helios.** The triage agent uses a larger model (30B–70B class) with tool access and multi-step reasoning.
+3. **Tool adapters** connect to downstream systems:
+   - Card management API (block, restrict, flag)
+   - Customer notification service (SMS alert, push notification, email)
+   - Case management system (open fraud case, attach evidence)
+   - Analyst queue (route to human with pre-built case packet)
+   - Runbook engine (select appropriate playbook)
+4. **Helios scheduling.** Because triage has a wider latency budget (5–10s), Helios can queue, batch, or degrade Tier 3 requests to protect Tier 2 capacity.
+
+### Sentinel + Helios Configuration for Tier 3
+
+```yaml
+apiVersion: inference.sentinel.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: triage-agent
+  namespace: ai-inference
+spec:
+  model: payment/triage-agent-70b
+  gpuCount: 4
+  replicas: 2
+  slo:
+    p99LatencyMs: 9000
+    maxErrorRate: 0.01
+  tokenBudget: 80000
+  sentinel:
+    enabled: true
+    circuitBreakerThreshold: 0.4
+    queueSize: 500
+    priorityLanes:
+      P0: high-value-triage       # > $10,000 or repeat fraud pattern
+      P1: standard-triage
+      P2: low-risk-review
+  helios:
+    enabled: true
+    policy: ACCEPT_QUEUE_DEGRADE
+    degradeAction: SUMMARY_ONLY   # shorter output, skip deep tool calls
+  scaling:
+    minReplicas: 2
+    maxReplicas: 8
+    metrics:
+      - type: custom
+        name: sentinel_p99_latency_ms
+        target: 7000
+```
+
+### Agent Design
+
+```
+Coordinator Agent
+  ├── Risk Classification Tool    → categorize triage urgency
+  ├── Card Action Tool            → block / restrict / flag via card management API
+  ├── Customer Notification Tool  → SMS / push / email via notification service
+  ├── Case Creation Tool          → open fraud case with evidence packet
+  ├── Analyst Routing Tool        → assign to human queue with pre-built context
+  └── Runbook Selection Tool      → select and initiate appropriate playbook
+```
+
+Sentinel sits in front of the entire agentic workflow. Every tool call inherits request IDs, quotas, queueing, tracing, and overload behavior.
+
+---
+
+## End-to-End Request Lifecycle
+
+Here is the full lifecycle for a declined transaction:
+
+1. A card-present purchase arrives over the network. TLS terminates. The request is assigned to a worker by card/device hash.
+2. **Tier 1 (< 5 ms):** The worker parses the request zero-copy into a `TxnView`, builds the feature block, runs CPU scorers, optionally invokes the GPU branch, and produces a weighted ensemble score. Decision: **No-Go**. The worker publishes the decision, features, scores, and reason stub into the shared Arrow event buffer.
+3. **Tier 2 (2–5 s):** An event-driven consumer picks up the No-Go event. Sentinel admits the request. The fast reasoning model receives the feature vector, model scores, and enriched context. It produces a structured explanation: velocity anomaly across geolocations, device fingerprint mismatch, confidence 0.92.
+4. **Tier 3 (5–10 s):** The triage agent picks up the explanation. Helios schedules the request. The agent determines: block the card, send an SMS alert, open a fraud case, and route to analyst queue with a pre-built evidence packet. Each action is dispatched through tool adapters.
+5. **Audit.** Every phase — Tier 1 decision, Tier 2 explanation, Tier 3 actions — is preserved in structured logs and traces with correlated `txn_id` and `trace_id`.
+
+---
+
+## Zero-Copy Data Flow Across All Three Tiers
+
+The most important architectural investment is the shared immutable event representation. It eliminates the classic anti-pattern of rebuilding transaction context at every tier boundary.
+
+```
+Tier 1 publishes:
+  ┌─────────────────────────────────────────────────┐
+  │  Arrow Event Buffer (shared memory / mmap)       │
+  │  ┌──────────┬──────────┬──────────┬───────────┐  │
+  │  │ txn_id   │ features │ scores   │ decision  │  │
+  │  │ metadata │ vector   │ per-model│ + reason  │  │
+  │  └──────────┴──────────┴──────────┴───────────┘  │
+  └─────────────────────────────────────────────────┘
+           │                      │
+           ▼                      ▼
+     Tier 2 reads              Tier 3 reads
+     (no deserialization)      (no deserialization)
+     enriches from cache       consumes Tier 2 output
+     reasons about decline     dispatches triage actions
+```
+
+**Key properties:**
+
+- Tier 1 writes once. Tiers 2 and 3 read by reference.
+- No JSON/protobuf rebuild at any boundary.
+- Arrow IPC or shared-memory segments enable cross-process zero-copy.
+- The same physical bytes feed reasoning, triage, logging, replay, analytics, and offline retraining.
+
+---
+
+## Why Sentinel Fits Each Tier
+
+| Tier | Challenge | Sentinel / Helios Capability |
+|------|-----------|------------------------------|
+| **1** | Tier 1 is not LLM-served, but its GPU branch needs protection | GPU-aware guardrails (NVML/DCGM) monitor the neural scoring GPU; circuit breaker isolates failing replicas |
+| **2** | Decline spikes cause burst load on the reasoner | Token admission control + bounded queue; priority lanes for high-value declines |
+| **2** | Explanation must start streaming quickly | SSE streaming for fast first-token delivery |
+| **3** | Multi-step agent with tool calls is expensive | Helios predicts p99 and chooses accept / queue / degrade; degrade mode produces summary-only output |
+| **3** | One noisy triage workflow must not starve others | Per-priority concurrency ceilings; per-tenant token budgets |
+| **All** | Need to reconstruct every decision later | `request_id` / `trace_id` correlation across all three tiers; structured logs and traces |
+
+---
+
+## CUDA Graphs — Eliminating Launch Overhead Across Tiers
+
+### The Problem CUDA Graphs Solve
+
+Every time a GPU kernel is launched the normal way, the CPU must traverse the CUDA driver, validate parameters, serialize the launch command into the GPU command queue, and wait for the GPU to pick it up. For a single large matrix multiply this overhead is negligible — a few microseconds buried under milliseconds of compute. But in a payment-processing pipeline, the pattern is different:
+
+- Tier 1's compact neural scorer might execute **20–50 small kernels** per inference pass (embedding lookups, layer norms, small GEMMs, activations, a final classification head).
+- Each kernel may only do **5–20 µs of actual work**.
+- The CPU-side launch overhead for each kernel is roughly **3–10 µs**.
+
+At 30 kernels × 5 µs overhead, the launch tax alone is **150 µs** — a meaningful fraction of a 5 ms p99 budget. CUDA Graphs eliminate this tax by recording the entire kernel sequence once and replaying it as a single opaque GPU-side operation.
+
+### How CUDA Graphs Work (Conceptual)
+
+A CUDA Graph is a pre-recorded, immutable DAG of GPU operations: memory copies, kernel launches, synchronization points, and their dependencies. The lifecycle has three phases:
+
+1. **Capture.** During a warm-up pass, the application runs its normal CUDA code inside a capture context. The driver records every operation and its dependencies into a graph object instead of executing them immediately.
+
+2. **Instantiate.** The captured graph is compiled and optimized into an executable graph. The driver resolves memory addresses, fuses compatible operations, and eliminates redundant synchronization. This is done once at startup.
+
+3. **Launch.** On every subsequent inference, the application launches the executable graph with a single `cudaGraphLaunch()` call. The entire kernel sequence replays on the GPU with minimal CPU involvement. The CPU cost drops from per-kernel overhead to a single submission — typically **under 5 µs total** regardless of how many kernels the graph contains.
+
+### Why This Matters for Payment Processing
+
+| Without CUDA Graphs | With CUDA Graphs |
+|---------------------|------------------|
+| CPU submits 30 kernels individually | CPU submits 1 graph launch |
+| ~150 µs of launch overhead | ~3–5 µs of launch overhead |
+| CPU busy serializing launches (cannot do other work) | CPU free to run CPU scorers, feature engineering, or service the next request |
+| Each launch traverses the full driver stack | Graph replay is a lightweight GPU-side operation |
+| Kernel scheduling is reactive (GPU waits for each launch) | Kernel scheduling is pre-planned (GPU executes the full pipeline without pausing) |
+
+The overhead savings compound at scale. If a worker handles 2,000 TPS and each transaction touches the GPU, eliminating 145 µs of launch overhead per request recovers **290 ms of CPU time per second per core** — time that can be used for CPU scoring instead.
+
+### Tier-by-Tier Application
+
+#### Tier 1 — Neural Scoring (Biggest Win)
+
+This is where CUDA Graphs have the most impact, because the latency budget is the tightest and the model is the smallest (meaning launch overhead is a larger fraction of total GPU time).
+
+**What gets captured into the graph:**
+
+- Feature tensor copy from pinned host buffer to device input buffer
+- Embedding lookup kernels (device/merchant/card embeddings)
+- Dense layer forward passes (small GEMMs + activations)
+- Cross-feature interaction kernels (if using a factorization machine or attention head)
+- Classification head (final linear + sigmoid)
+- Score copy from device output buffer back to pinned host buffer
+
+**Preconditions that make this work well:**
+
+| Requirement | How Tier 1 Satisfies It |
+|-------------|------------------------|
+| Fixed input shapes | Feature vector length is constant (same number of numeric features, same embedding dimensions) |
+| Fixed execution path | No conditional branching inside the model; same layers execute every time |
+| Preallocated memory | Input and output buffers are pinned and preallocated per worker; no dynamic allocation |
+| Deterministic graph topology | Model architecture does not change between requests |
+
+If the micro-batching window produces batches of variable size (for example, batch-of-1 under low load, batch-of-8 under peak), pre-instantiate a small set of graphs for each expected batch size (1, 2, 4, 8). At launch time, select the matching graph. This avoids the need for dynamic shapes while still supporting load-adaptive batching.
+
+**Interaction with micro-batching and CUDA streams:**
+
+Each per-worker CUDA stream can own its own instantiated graph. The worker:
+
+1. Fills the pinned input buffer with one micro-batch of feature vectors.
+2. Launches the pre-instantiated graph on its stream.
+3. Continues CPU scoring for the next batch (overlap).
+4. Synchronizes with the stream to collect GPU scores when needed.
+
+Because the graph launch is a single call, the CPU is free almost immediately, enabling effective overlap of CPU and GPU work within the same Tier 1 pipeline.
+
+#### Tier 2 — Decline Reasoning (Moderate Win)
+
+Tier 2 runs a compact generative model (13B class) for decline explanation. CUDA Graphs apply differently here because generative inference has two distinct phases:
+
+**Prefill phase.** The entire input context is processed in one forward pass. This is a large, compute-bound operation with relatively few kernel launches per layer. Launch overhead is already a small fraction of total time. CUDA Graphs provide a modest improvement — primarily by pre-planning the layer-by-layer execution and eliminating inter-kernel scheduling gaps.
+
+**Decode phase.** Each new token requires a full forward pass through the model, but with a very small effective batch dimension (the single new token, plus the KV cache). Each decode step involves many small kernels (attention with KV cache lookup, layer norms, small GEMMs). Here, launch overhead becomes significant again — similar to the Tier 1 pattern.
+
+Modern inference runtimes like vLLM and TensorRT-LLM already use CUDA Graphs internally for the decode phase. They capture the decode step's kernel sequence once (per batch-size bucket) and replay it on every token generation. This is one of the reasons decode throughput on these runtimes is substantially better than naive PyTorch inference.
+
+**What Sentinel should know:** When Helios models the expected latency for a Tier 2 request, the decode cost prediction should assume CUDA-Graph-accelerated decode steps. If the runtime falls back from graph replay to eager execution (for example, because a new batch size was encountered or memory pressure forced a re-plan), Helios should detect the latency deviation and adjust its predictions.
+
+#### Tier 3 — Quick Triage (Indirect / Marginal Win)
+
+Tier 3 runs a larger model (70B class) with multi-step tool use. The latency budget is 5–10 seconds, and the dominant costs are:
+
+- Multiple sequential LLM forward passes (one per reasoning step)
+- Tool-call latency (case management API, notification service, etc.)
+- Network round-trips to downstream systems
+
+GPU kernel launch overhead is a small fraction of the total. CUDA Graphs still help inside each individual forward pass (the inference runtime uses them for decode), but the system-level gains are dominated by other factors: tool-call parallelism, prompt engineering for fewer reasoning steps, and Helios scheduling.
+
+**Bottom line:** For Tier 3, CUDA Graphs are a runtime-level optimization that "just works" inside vLLM/TensorRT-LLM. The system architect does not need to design around them explicitly.
+
+### Where CUDA Graphs Do Not Help
+
+It is important to understand the boundaries:
+
+| Situation | Why CUDA Graphs Cannot Help |
+|-----------|-----------------------------|
+| **Variable-length input sequences** (Tier 2/3 prefill) | Each prompt length produces a different kernel grid. Graphs require fixed shapes. The runtime handles this by capturing graphs per-bucket or falling back to eager mode for rare sizes. |
+| **Dynamic control flow** | If the model has conditional execution paths (mixture-of-experts routing, early exit), the graph topology changes per request and cannot be pre-captured. |
+| **Host-side logic between kernels** | If the CPU must inspect an intermediate result to decide what kernel to launch next, the graph cannot encode that decision. Fortunately, Tier 1's neural scorer typically has no such branching. |
+| **First-request cold start** | The capture and instantiate phases add latency on the first invocation. This is a one-time cost at startup, not a per-request cost. For a payment system that runs continuously, this is irrelevant after warm-up. |
+| **Memory pressure** | CUDA Graphs pin their memory allocations at instantiation time. Under extreme memory pressure, this can reduce the flexibility of the memory allocator. For Tier 1 (small model, preallocated buffers), this is not a concern. For Tier 2/3 (larger models, shared KV cache pool), the inference runtime manages this trade-off internally. |
+
+### Summary: CUDA Graphs Impact by Tier
+
+| Tier | Primary Benefit | Estimated Overhead Reduction | Who Manages It |
+|------|----------------|------------------------------|----------------|
+| **1 — Decisioning** | Eliminates per-kernel launch tax on the tightest latency path | **~100–150 µs saved per inference** (significant at 5 ms budget) | **Application-level** — the Rust/CUDA scoring pipeline captures and manages its own graphs |
+| **2 — Reasoning** | Accelerates token-by-token decode phase | **~20–50 µs saved per decode step**, compounding over hundreds of tokens | **Runtime-level** — vLLM / TensorRT-LLM handles capture and replay internally |
+| **3 — Triage** | Same decode-phase benefit as Tier 2; dominated by tool-call latency | **Marginal** — total LLM time is a fraction of end-to-end triage time | **Runtime-level** — handled by the inference runtime; no explicit design needed |
+
+The key takeaway: CUDA Graphs are most architecturally significant in Tier 1, where you are designing the GPU pipeline yourself and where every microsecond matters. In Tiers 2 and 3, they are an infrastructure optimization that the serving runtime handles transparently.
+
+---
+
+## GPU-Aware Guardrails Across Tiers
+
+Sentinel's NVML/DCGM polling at < 100 ms intervals applies to both the Tier 1 neural scoring GPU pool and the Tier 2/3 inference GPU pools:
+
+| GPU Signal | Risk | Sentinel Action |
+|-----------|------|-----------------|
+| `memory.free < 15%` | KV cache OOM for Tier 2/3; inference crash | Throttle admission; no new large-context agents |
+| `temperature > 80°C` | Thermal throttling → latency spike → SLA breach | Reduce batch size; alert ops |
+| `ECC errors > 0` | Silent data corruption → wrong fraud decision | Drain GPU; circuit-break replica |
+| `power.draw > 95% TDP` | Power throttling → unpredictable latency | Cap concurrent requests |
+| `Metrics stale > 500 ms` | Blind operation → unknown risk | Deny all new requests (fail-closed) |
+
+The fail-closed posture on stale metrics matches the same philosophy payment processors use for HSM connectivity.
+
+---
+
+## Observability
+
+You should be able to answer all of these questions from telemetry:
+
+**Tier 1:**
+
+- What is the p99 ensemble scoring latency?
+- How often is the GPU branch invoked versus CPU-only?
+- What is the micro-batch fill rate and GPU utilization?
+- What percentage of transactions are No-Go?
+
+**Tier 2:**
+
+- What is the first-token p99 for decline reasoning?
+- What is the queue depth during decline spikes?
+- Which requests were degraded, queued, or rejected?
+- What is the Helios prediction error versus observed p99?
+
+**Tier 3:**
+
+- What is the end-to-end triage latency (model + tool calls)?
+- Which tool calls dominate latency?
+- How many triage actions completed within the 10-second SLA?
+- How often does degrade mode fire?
+
+**Cross-tier:**
+
+- Can I correlate a single `txn_id` from Tier 1 decision through Tier 2 explanation through Tier 3 actions?
+- Is the Arrow event buffer keeping up with publish rate?
+- What is the retraining feature-capture lag?
+
+Core metrics:
+
+- p50, p95, p99 latency per tier
+- queue depth and wait time per tier
+- token consumption per tier
+- reject rate and degrade rate
+- tool latency by downstream system
+- GPU memory headroom and utilization
+- Arrow event buffer throughput and consumer lag
+
+---
+
+## Security and Data Handling
+
+- PAN (primary account number) and CVV are **never** included in Arrow event buffers or model prompts. All sensitive fields are tokenized or masked before feature construction.
+- Retrieval for Tiers 2 and 3 enforces tenant and role boundaries before any data reaches a model.
+- Tool calls and final answers are retained in an immutable audit trail.
+- Pinned host memory used by the GPU path is zeroed on arena reset to prevent data leakage across requests.
+- PCI-DSS: Sentinel's SSE relay is the natural interception point for PII filtering before tokens reach any downstream consumer.
+
+---
+
+## Kubernetes Platform Integration
+
+Separate `ModelDeployment` CRDs per tier ensure workload isolation:
+
+| Tier | GPU Pool | Scaling Basis | Min Replicas |
+|------|----------|---------------|-------------|
+| **1** (neural scoring) | Dedicated real-time pool | Micro-batch queue depth + GPU duty cycle | 4 (N+1 redundancy) |
+| **2** (reasoning) | Near-real-time pool | Sentinel p99 latency + queue depth | 4 |
+| **3** (triage) | Batch-tolerant pool | Sentinel p99 latency + queue depth; auto-scales for spikes | 2 |
+
+Black Friday / peak-season scaling: Tier 2 scales 4→16 replicas; Tier 3 scales 2→8. Tier 1 GPU pool scales independently based on transaction volume.
+
+PodDisruptionBudgets ensure N-1 availability during rolling deploys. Graceful drain prevents in-flight requests from being dropped.
+
+---
+
+## Benchmark Plan
+
+Validate with realistic workloads across all three tiers:
+
+| Scenario | What It Tests |
+|----------|---------------|
+| **Sustained peak load** | 20,000+ TPS through Tier 1; 15% No-Go rate feeding Tiers 2 and 3 |
+| **Decline spike** | Issuer-wide decline event; Tier 2 queue behavior under 5× burst |
+| **Mixed traffic** | High-value flagged transactions (P0) mixed with standard declines (P1) |
+| **GPU replica failure** | One Tier 1 neural scoring GPU fails; circuit breaker and failover |
+| **Tier 3 tool latency** | Case management API responds slowly; Helios degrade behavior |
+| **Arrow buffer saturation** | Event buffer approaches capacity; consumer lag and backpressure |
+
+**Targets:**
+
+| Metric | Target |
+|--------|--------|
+| Tier 1 p99 ensemble latency | < 5 ms |
+| Tier 2 p99 first-token latency | < 2 s |
+| Tier 2 p99 full-response latency | < 5 s |
+| Tier 3 p99 end-to-end triage latency | < 10 s |
+| Tier 1 throughput | > 20,000 TPS sustained |
+| Cross-tier trace completeness | 100% |
+| No-Go → explanation → triage correlation | 100% |
+
+---
+
+## What Not To Do
+
+- Do not put generative reasoning or large language models in the Tier 1 hot path.
+- Do not rebuild transaction context at each tier boundary. Publish once; consume by reference.
+- Do not use JSON or protobuf as the internal hot-path data format in Tier 1. Use fixed-layout structs with borrowed references.
+- Do not put full transaction payloads in ring buffers. Use compact descriptors.
+- Do not use MPMC queues or shared mutable feature maps where SPSC per-core ownership suffices.
+- Do not allocate GPU memory per-request. Preallocate everything.
+- Do not let Tier 3 batch workloads starve Tier 2 reasoning. Separate GPU pools and token budgets.
+- Do not benchmark only average latency. p99 and p999 are the real operational constraints.
+- Do not allow raw sensitive records (PAN, CVV) into any Arrow buffer or model prompt.
+
+---
+
+## Three-Minute Story
+
+**Situation.** A tier-1 credit-card issuer needed an AI-augmented payment system that could make millisecond fraud decisions, explain declines in seconds, and kick off automated triage within 10 seconds — all at 20,000+ TPS with strict tail-latency SLAs.
+
+**Approach.** I designed a three-tier architecture. Tier 1 is a zero-copy Rust/CUDA scoring pipeline: per-core arenas, borrowed transaction views, shared feature blocks, an ensemble of XGBoost/GBDT/scorecard/neural models, and a binary Go/No-Go output — all within 5 ms p99. Tier 2 uses a fast reasoning model behind Sentinel to explain No-Go decisions within 2–5 seconds. Tier 3 uses a deeper agentic workflow behind Sentinel + Helios to dispatch triage actions within 5–10 seconds. The key integration is an Arrow-compatible shared event buffer that lets all three tiers consume the same transaction context without re-parsing or reserializing.
+
+**Measurement.** I would validate with sustained peak loads, decline spikes, GPU replica failures, and slow downstream tools. The critical outputs would be p99 latency per tier, queue and degrade behavior under overload, cross-tier trace completeness, and the zero-copy overhead — bytes copied per transaction across the full pipeline.
+
+**Learning.** The winning pattern is not "put AI everywhere." It is "keep the fraud decisioning path deterministic and zero-copy, then engineer the reasoning and triage layers with the same production discipline using Sentinel." The zero-copy investment pays off most at the tier boundary: publish once in Arrow, let reasoning, triage, logging, analytics, and retraining all consume the same physical bytes.
+
+---
+
+## Summary
+
+This use case combines nearly every major topic in the study guide:
+
+- **Section A:** GPU architecture, CUDA, inference runtime, and guardrails — Tier 1 neural scoring, pinned buffers, CUDA Graphs, and micro-batching
+- **Section B:** Linux scheduling and memory — per-core affinity, arena allocation, SPSC queues, cache-line alignment
+- **Section C:** Benchmarking and telemetry — cross-tier latency measurement, eBPF network visibility, regression gates
+- **Section D:** Admission control, queueing, degradation, and predictive scheduling — Sentinel + Helios protecting Tiers 2 and 3
+- **Section E:** Networking — zero-copy data movement, Arrow IPC, shared memory segments
+- **Section F:** Storage — Arrow columnar format, feature store, event buffer design
+- **Section G:** Distributed training context — precomputed embeddings, offline model updates
+- **Section H:** Kubernetes deployment — `ModelDeployment` CRDs, HPA, PDB, per-tier GPU pools
+- **Section X:** Cross-cutting — end-to-end traceability, security, auditability
+
+If you can explain this three-tier architecture clearly — the zero-copy hot path, the shared Arrow boundary, and the Sentinel-governed reasoning and triage tiers — you are describing a production-grade systems design for AI in a high-stakes financial environment.
+
+---
+
+[Back to Section I Overview](overview.md) | [Back to Index](../index.md)
